@@ -8,6 +8,7 @@ plain-DTS fallback.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import importlib
 import os
 import pickle
@@ -30,7 +31,39 @@ class DTSNode:
     parent: "DTSNode | None" = None
     line_start: int = 0
     compat: list[str] = field(default_factory=list)
+    dependencies: list["Dependency"] = field(default_factory=list)
     phandle_refs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Dependency:
+    property: str
+    target: str
+    dep_type: str = "other"
+
+
+def _infer_dependency_type(prop_name: str) -> str:
+    key = prop_name.lower().strip()
+
+    if key.startswith("pinctrl"):
+        return "pinctrl"
+    if key.startswith("interrupt"):
+        return "interrupt"
+    if key in {"clocks", "clock", "assigned-clocks", "assigned-clock-parents"}:
+        return "clock"
+    if key in {"resets", "reset-gpios", "reset"}:
+        return "reset"
+    if key in {"dmas", "dma"}:
+        return "dma"
+    if key in {"gpios", "gpio", "cs-gpios", "irq-gpios", "reset-gpios", "enable-gpios"}:
+        return "gpio"
+    if key in {"pwms", "pwm"}:
+        return "pwm"
+    if key in {"iommus", "mboxes", "io-channels", "phys", "power-domains", "vin-supply", "vdd-supply"}:
+        return "provider"
+    if key in {"bus", "parent-bus", "on-bus"}:
+        return "bus"
+    return "other"
 
 
 class DTSParser:
@@ -105,6 +138,10 @@ class DTSParser:
     def _extract_phandles(value: str) -> list[str]:
         return re.findall(r"&([A-Za-z_][A-Za-z0-9_]*)", value)
 
+    @staticmethod
+    def _extract_phandle_paths(value: str) -> list[str]:
+        return re.findall(r"&\{([^}]+)\}", value)
+
     def parse(self) -> DTSNode:
         lines = self.text.splitlines()
         lines = self._strip_comments(lines)
@@ -176,10 +213,35 @@ class DTSParser:
                     if key == "compatible" and isinstance(value, str):
                         stack[-1].compat = self._extract_compat(value)
                     if isinstance(value, str):
-                        stack[-1].phandle_refs.extend(self._extract_phandles(value))
+                        labels = self._extract_phandles(value)
+                        paths = self._extract_phandle_paths(value)
+                        for label in labels:
+                            stack[-1].dependencies.append(
+                                Dependency(
+                                    property=key,
+                                    target=f"&{label}",
+                                    dep_type=_infer_dependency_type(key),
+                                )
+                            )
+                        for path_ref in paths:
+                            normalized = path_ref if path_ref.startswith("/") else f"/{path_ref}"
+                            stack[-1].dependencies.append(
+                                Dependency(
+                                    property=key,
+                                    target=normalized,
+                                    dep_type=_infer_dependency_type(key),
+                                )
+                            )
+
+        def _collect_phandle_refs(node: DTSNode) -> None:
+            node.phandle_refs = [dep.target for dep in node.dependencies]
+            for child in node.children:
+                _collect_phandle_refs(child)
 
         if root is None:
             raise ValueError("Unable to parse DTS root node")
+
+        _collect_phandle_refs(root)
 
         return root
 
@@ -268,34 +330,76 @@ def _build_tree_from_edt(edt) -> DTSNode:
         if dnode.compat:
             dnode.properties["compatible"] = ", ".join(dnode.compat)
 
-        refs: list[str] = []
+        deps: list[Dependency] = []
         for prop_name, prop in getattr(enode, "props", {}).items():
             pval = getattr(prop, "val", None)
             dnode.properties[prop_name] = _format_edt_prop_value(pval)
 
             for item in _iter_nested_values(pval):
                 if hasattr(item, "path"):
-                    refs.append(str(item.path))
+                    deps.append(
+                        Dependency(
+                            property=prop_name,
+                            target=str(item.path),
+                            dep_type=_infer_dependency_type(prop_name),
+                        )
+                    )
                 elif hasattr(item, "controller") and hasattr(item.controller, "path"):
-                    refs.append(str(item.controller.path))
+                    deps.append(
+                        Dependency(
+                            property=prop_name,
+                            target=str(item.controller.path),
+                            dep_type=_infer_dependency_type(prop_name),
+                        )
+                    )
 
         for intr in getattr(enode, "interrupts", []) or []:
             controller = getattr(intr, "controller", None)
             if controller is not None and hasattr(controller, "path"):
-                refs.append(str(controller.path))
+                deps.append(
+                    Dependency(
+                        property="interrupts",
+                        target=str(controller.path),
+                        dep_type="interrupt",
+                    )
+                )
         for pc in getattr(enode, "pinctrls", []) or []:
             for conf_node in getattr(pc, "conf_nodes", []) or []:
                 if hasattr(conf_node, "path"):
-                    refs.append(str(conf_node.path))
+                    deps.append(
+                        Dependency(
+                            property="pinctrl",
+                            target=str(conf_node.path),
+                            dep_type="pinctrl",
+                        )
+                    )
 
-        dedup = []
-        seen_ref = set()
-        for r in refs:
-            if r in seen_ref:
+        bus = getattr(enode, "bus", None)
+        if bus is not None and hasattr(bus, "path"):
+            deps.append(Dependency(property="bus", target=str(bus.path), dep_type="bus"))
+
+        depends_on = getattr(enode, "depends_on", None)
+        for dep_node in depends_on or []:
+            if hasattr(dep_node, "path"):
+                deps.append(
+                    Dependency(
+                        property="depends_on",
+                        target=str(dep_node.path),
+                        dep_type="other",
+                    )
+                )
+
+        dedup: list[Dependency] = []
+        seen_ref: set[tuple[str, str, str]] = set()
+        for dep in deps:
+            key = (dep.property, dep.target, dep.dep_type)
+            if key in seen_ref:
                 continue
-            seen_ref.add(r)
-            dedup.append(r)
-        dnode.phandle_refs = dedup
+            seen_ref.add(key)
+            dedup.append(dep)
+
+        dnode.dependencies = dedup
+        dnode.phandle_refs = [dep.target for dep in dedup]
 
         node_map[enode] = dnode
 
@@ -346,6 +450,14 @@ class DTSExplorerApp:
 
         self.node_by_tree_id: dict[str, DTSNode] = {}
         self.node_by_path: dict[str, DTSNode] = {}
+        self.node_by_label: dict[str, DTSNode] = {}
+
+        self.dependency_graph: dict[str, list[str]] = {}
+        self.reverse_graph: dict[str, list[str]] = {}
+        self.compat_index: dict[str, list[str]] = {}
+        self.compat_search_var = tk.StringVar()
+        self.dep_jump_targets: list[str] = []
+        self.consumer_jump_targets: list[str] = []
 
         self.search_var = tk.StringVar()
         self.filter_okay_var = tk.BooleanVar(value=False)
@@ -360,6 +472,8 @@ class DTSExplorerApp:
 
     def _index_nodes(self, node: DTSNode) -> None:
         self.node_by_path[node.path] = node
+        if node.label:
+            self.node_by_label[node.label] = node
         for child in node.children:
             self._index_nodes(child)
 
@@ -395,6 +509,12 @@ class DTSExplorerApp:
 
         ttk.Button(top, text="Search", command=self._run_search).pack(side=tk.LEFT)
         ttk.Button(top, text="Reset", command=self._reset_search).pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(top, text="Compatible:").pack(side=tk.LEFT, padx=(16, 4))
+        compat_entry = ttk.Entry(top, textvariable=self.compat_search_var, width=30)
+        compat_entry.pack(side=tk.LEFT)
+        compat_entry.bind("<Return>", lambda _: self._find_compatible())
+        ttk.Button(top, text="Find", command=self._find_compatible).pack(side=tk.LEFT, padx=(8, 0))
 
         main = ttk.Panedwindow(self.tk, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True)
@@ -436,10 +556,15 @@ class DTSExplorerApp:
         prop_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.prop_tree.configure(yscrollcommand=prop_scroll.set)
 
-        ttk.Label(info, text="Phandle references (double click to jump):").pack(anchor=tk.W, pady=(10, 4))
-        self.refs_list = tk.Listbox(info, height=8)
-        self.refs_list.pack(fill=tk.BOTH, expand=False)
-        self.refs_list.bind("<Double-Button-1>", self._jump_to_reference)
+        ttk.Label(info, text="Dependencies (double click to jump):").pack(anchor=tk.W, pady=(10, 4))
+        self.deps_list = tk.Listbox(info, height=8)
+        self.deps_list.pack(fill=tk.BOTH, expand=False)
+        self.deps_list.bind("<Double-Button-1>", self._jump_to_dependency)
+
+        ttk.Label(info, text="Consumers / Used By (double click to jump):").pack(anchor=tk.W, pady=(10, 4))
+        self.consumers_list = tk.Listbox(info, height=8)
+        self.consumers_list.pack(fill=tk.BOTH, expand=False)
+        self.consumers_list.bind("<Double-Button-1>", self._jump_to_consumer)
 
         status = ttk.Frame(self.tk, padding=(8, 0, 8, 8))
         status.pack(fill=tk.X)
@@ -481,6 +606,108 @@ class DTSExplorerApp:
         yield node
         for child in node.children:
             yield from self._iter_nodes(child)
+
+    def _resolve_dependency_target(self, dep: Dependency) -> str | None:
+        target = dep.target.strip()
+        if not target:
+            return None
+        if target.startswith("/"):
+            return target if target in self.node_by_path else None
+        if target.startswith("&"):
+            label = target[1:]
+            node = self.node_by_label.get(label)
+            return node.path if node else None
+        node = self.node_by_label.get(target)
+        if node:
+            return node.path
+        if target in self.node_by_path:
+            return target
+        return None
+
+    def _rebuild_indexes(self) -> None:
+        if self.dts_root is None:
+            self.dependency_graph = {}
+            self.reverse_graph = {}
+            self.compat_index = {}
+            return
+
+        dep_graph: dict[str, list[str]] = defaultdict(list)
+        rev_graph: dict[str, list[str]] = defaultdict(list)
+        comp_index: dict[str, list[str]] = defaultdict(list)
+
+        for node in self._iter_nodes(self.dts_root):
+            seen_targets: set[str] = set()
+            for dep in node.dependencies:
+                resolved = self._resolve_dependency_target(dep)
+                if resolved is None or resolved in seen_targets:
+                    continue
+                seen_targets.add(resolved)
+                dep_graph[node.path].append(resolved)
+                rev_graph[resolved].append(node.path)
+
+            for comp in node.compat:
+                c = comp.strip().lower()
+                if c:
+                    comp_index[c].append(node.path)
+
+        self.dependency_graph = {k: sorted(v) for k, v in dep_graph.items()}
+        self.reverse_graph = {k: sorted(v) for k, v in rev_graph.items()}
+        self.compat_index = {k: sorted(v) for k, v in comp_index.items()}
+
+    def _select_node_by_path(self, path: str) -> bool:
+        target_item = None
+        for item_id, node in self.node_by_tree_id.items():
+            if node.path == path:
+                target_item = item_id
+                break
+
+        if not target_item:
+            return False
+
+        cur = target_item
+        while cur:
+            parent = self.tree.parent(cur)
+            if parent:
+                self.tree.item(parent, open=True)
+            cur = parent
+
+        self.tree.selection_set(target_item)
+        self.tree.focus(target_item)
+        self.tree.see(target_item)
+        return True
+
+    def _find_compatible(self) -> None:
+        if self.dts_root is None:
+            self.status_var.set("No data loaded")
+            return
+
+        query = self.compat_search_var.get().strip().lower()
+        if not query:
+            self.status_var.set("Insert a compatible string to search")
+            return
+
+        exact = self.compat_index.get(query, [])
+        if exact:
+            self._populate_tree()
+            if self._select_node_by_path(exact[0]):
+                self.status_var.set(f"Compatible '{query}' matches={len(exact)}")
+            else:
+                self.status_var.set(f"Compatible '{query}' matches={len(exact)} (not visible in current tree)")
+            return
+
+        partial_matches: list[str] = []
+        for comp, paths in self.compat_index.items():
+            if query in comp:
+                partial_matches.extend(paths)
+
+        dedup_partial = sorted(set(partial_matches))
+        if not dedup_partial:
+            self.status_var.set(f"Compatible '{query}' matches=0")
+            return
+
+        self._populate_tree()
+        self._select_node_by_path(dedup_partial[0])
+        self.status_var.set(f"Compatible '{query}' partial_matches={len(dedup_partial)}")
 
     def _node_matches(self, node: DTSNode, query: str, only_okay: bool) -> bool:
         if only_okay:
@@ -595,87 +822,72 @@ class DTSExplorerApp:
             val = node.properties[key]
             self.prop_tree.insert("", tk.END, text=key, values=(str(val),))
 
-        self.refs_list.delete(0, tk.END)
-        unique_refs = []
-        seen = set()
-        for ref in node.phandle_refs:
-            if ref in seen:
+        self.deps_list.delete(0, tk.END)
+        self.dep_jump_targets = []
+
+        seen_deps: set[tuple[str, str, str]] = set()
+        for dep in node.dependencies:
+            dep_key = (dep.property, dep.dep_type, dep.target)
+            if dep_key in seen_deps:
                 continue
-            seen.add(ref)
-            if ref.startswith("/"):
-                target = self.node_by_path.get(ref)
-                if target:
-                    unique_refs.append(f"{ref} -> {target.path}")
-                else:
-                    unique_refs.append(f"{ref} -> <not found>")
+            seen_deps.add(dep_key)
+
+            resolved = self._resolve_dependency_target(dep)
+            if resolved is None:
+                label = f"{dep.dep_type:10s} {dep.property:20s} -> {dep.target} (unresolved)"
+                jump_target = ""
             else:
-                target = None
-                for n in self.node_by_path.values():
-                    if n.label == ref:
-                        target = n
-                        break
-                if target:
-                    unique_refs.append(f"&{ref} -> {target.path}")
-                else:
-                    unique_refs.append(f"&{ref} -> <not found>")
+                label = f"{dep.dep_type:10s} {dep.property:20s} -> {resolved}"
+                jump_target = resolved
 
-        for item in unique_refs:
-            self.refs_list.insert(tk.END, item)
+            self.deps_list.insert(tk.END, label)
+            self.dep_jump_targets.append(jump_target)
 
-    def _jump_to_reference(self, _event) -> None:
-        selected = self.refs_list.curselection()
+        self.consumers_list.delete(0, tk.END)
+        self.consumer_jump_targets = []
+        for consumer_path in self.reverse_graph.get(node.path, []):
+            consumer = self.node_by_path.get(consumer_path)
+            if consumer is None:
+                display = consumer_path
+            elif consumer.label:
+                display = f"{consumer.name} ({consumer.label})  [{consumer.path}]"
+            else:
+                display = f"{consumer.name}  [{consumer.path}]"
+
+            self.consumers_list.insert(tk.END, display)
+            self.consumer_jump_targets.append(consumer_path)
+
+    def _jump_to_dependency(self, _event) -> None:
+        selected = self.deps_list.curselection()
         if not selected:
             return
-        txt = self.refs_list.get(selected[0])
-
-        if txt.startswith("/"):
-            path = txt.split(" -> ", 1)[0]
-            target_item = None
-            for item_id, node in self.node_by_tree_id.items():
-                if node.path == path:
-                    target_item = item_id
-                    break
-            if not target_item:
-                messagebox.showinfo("Reference", f"No visible node found for path '{path}'")
-                return
-
-            cur = target_item
-            while cur:
-                parent = self.tree.parent(cur)
-                if parent:
-                    self.tree.item(parent, open=True)
-                cur = parent
-
-            self.tree.selection_set(target_item)
-            self.tree.focus(target_item)
-            self.tree.see(target_item)
+        idx = selected[0]
+        if idx >= len(self.dep_jump_targets):
             return
 
-        m = re.match(r"&([A-Za-z_][A-Za-z0-9_]*)", txt)
-        if not m:
-            return
-        label = m.group(1)
-
-        target_item = None
-        for item_id, node in self.node_by_tree_id.items():
-            if node.label == label:
-                target_item = item_id
-                break
-
-        if not target_item:
-            messagebox.showinfo("Reference", f"No visible node found for label '&{label}'")
+        target = self.dep_jump_targets[idx]
+        if not target:
+            messagebox.showinfo("Dependency", "Cannot jump to unresolved dependency")
             return
 
-        cur = target_item
-        while cur:
-            parent = self.tree.parent(cur)
-            if parent:
-                self.tree.item(parent, open=True)
-            cur = parent
+        if self._select_node_by_path(target):
+            return
 
-        self.tree.selection_set(target_item)
-        self.tree.focus(target_item)
-        self.tree.see(target_item)
+        messagebox.showinfo("Dependency", f"No visible node found for path '{target}'")
+
+    def _jump_to_consumer(self, _event) -> None:
+        selected = self.consumers_list.curselection()
+        if not selected:
+            return
+        idx = selected[0]
+        if idx >= len(self.consumer_jump_targets):
+            return
+
+        target = self.consumer_jump_targets[idx]
+        if self._select_node_by_path(target):
+            return
+
+        messagebox.showinfo("Consumers", f"No visible node found for path '{target}'")
 
     def _on_browse_clicked(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -715,14 +927,21 @@ class DTSExplorerApp:
         self.backend = backend
 
         self.node_by_path.clear()
+        self.node_by_label.clear()
         self._index_nodes(root)
+        self._rebuild_indexes()
         self._populate_tree()
         self.summary_var.set("Select a node")
         self.prop_tree.delete(*self.prop_tree.get_children(""))
-        self.refs_list.delete(0, tk.END)
+        self.deps_list.delete(0, tk.END)
+        self.consumers_list.delete(0, tk.END)
+        self.dep_jump_targets = []
+        self.consumer_jump_targets = []
 
         self.tk.title(f"Zephyr DTS Explorer - {input_path.name}")
-        self.status_var.set(f"Loaded: {input_path}  backend={backend}")
+        self.status_var.set(
+            f"Loaded: {input_path}  backend={backend}  nodes={len(self.node_by_path)}  compatibles={len(self.compat_index)}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
