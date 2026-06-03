@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import importlib
+import json
 import os
 import pickle
 import re
@@ -311,6 +312,19 @@ def _resolve_edtlib_for_source(source_path: Path):
 def _build_tree_from_edt(edt) -> DTSNode:
     node_map: dict[object, DTSNode] = {}
 
+    def _extract_path_ref(obj) -> str | None:
+        if obj is None:
+            return None
+        if hasattr(obj, "path"):
+            return str(obj.path)
+        node = getattr(obj, "node", None)
+        if node is not None and hasattr(node, "path"):
+            return str(node.path)
+        controller = getattr(obj, "controller", None)
+        if controller is not None and hasattr(controller, "path"):
+            return str(controller.path)
+        return None
+
     for enode in edt.nodes:
         label = enode.labels[0] if getattr(enode, "labels", None) else None
         unit_addr = None
@@ -336,19 +350,12 @@ def _build_tree_from_edt(edt) -> DTSNode:
             dnode.properties[prop_name] = _format_edt_prop_value(pval)
 
             for item in _iter_nested_values(pval):
-                if hasattr(item, "path"):
+                ref_path = _extract_path_ref(item)
+                if ref_path is not None:
                     deps.append(
                         Dependency(
                             property=prop_name,
-                            target=str(item.path),
-                            dep_type=_infer_dependency_type(prop_name),
-                        )
-                    )
-                elif hasattr(item, "controller") and hasattr(item.controller, "path"):
-                    deps.append(
-                        Dependency(
-                            property=prop_name,
-                            target=str(item.controller.path),
+                            target=ref_path,
                             dep_type=_infer_dependency_type(prop_name),
                         )
                     )
@@ -378,13 +385,22 @@ def _build_tree_from_edt(edt) -> DTSNode:
         if bus is not None and hasattr(bus, "path"):
             deps.append(Dependency(property="bus", target=str(bus.path), dep_type="bus"))
 
+        on_buses = list(getattr(enode, "on_buses", []) or [])
+        if on_buses:
+            dnode.properties["on-buses"] = ", ".join(str(x) for x in on_buses)
+            for on_bus in on_buses:
+                ref = _extract_path_ref(on_bus)
+                if ref is not None:
+                    deps.append(Dependency(property="on_buses", target=ref, dep_type="bus"))
+
         depends_on = getattr(enode, "depends_on", None)
         for dep_node in depends_on or []:
-            if hasattr(dep_node, "path"):
+            ref = _extract_path_ref(dep_node)
+            if ref is not None:
                 deps.append(
                     Dependency(
                         property="depends_on",
-                        target=str(dep_node.path),
+                        target=ref,
                         dep_type="other",
                     )
                 )
@@ -456,8 +472,10 @@ class DTSExplorerApp:
         self.reverse_graph: dict[str, list[str]] = {}
         self.compat_index: dict[str, list[str]] = {}
         self.compat_search_var = tk.StringVar()
+        self.graph_depth_var = tk.IntVar(value=1)
         self.dep_jump_targets: list[str] = []
         self.consumer_jump_targets: list[str] = []
+        self.init_jump_targets: list[str] = []
 
         self.search_var = tk.StringVar()
         self.filter_okay_var = tk.BooleanVar(value=False)
@@ -516,6 +534,14 @@ class DTSExplorerApp:
         compat_entry.bind("<Return>", lambda _: self._find_compatible())
         ttk.Button(top, text="Find", command=self._find_compatible).pack(side=tk.LEFT, padx=(8, 0))
 
+        ttk.Label(top, text="Depth:").pack(side=tk.LEFT, padx=(16, 4))
+        depth_spin = ttk.Spinbox(top, from_=1, to=6, textvariable=self.graph_depth_var, width=4)
+        depth_spin.pack(side=tk.LEFT)
+        ttk.Button(top, text="Show dependency graph", command=self._show_dependency_graph).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(top, text="Export JSON", command=self._export_selected_json).pack(side=tk.LEFT, padx=(8, 0))
+
         main = ttk.Panedwindow(self.tk, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -565,6 +591,11 @@ class DTSExplorerApp:
         self.consumers_list = tk.Listbox(info, height=8)
         self.consumers_list.pack(fill=tk.BOTH, expand=False)
         self.consumers_list.bind("<Double-Button-1>", self._jump_to_consumer)
+
+        ttk.Label(info, text="Initialization checks (double click to jump):").pack(anchor=tk.W, pady=(10, 4))
+        self.init_list = tk.Listbox(info, height=8)
+        self.init_list.pack(fill=tk.BOTH, expand=False)
+        self.init_list.bind("<Double-Button-1>", self._jump_to_initialization_target)
 
         status = ttk.Frame(self.tk, padding=(8, 0, 8, 8))
         status.pack(fill=tk.X)
@@ -639,7 +670,7 @@ class DTSExplorerApp:
             seen_targets: set[str] = set()
             for dep in node.dependencies:
                 resolved = self._resolve_dependency_target(dep)
-                if resolved is None or resolved in seen_targets:
+                if resolved is None or resolved == node.path or resolved in seen_targets:
                     continue
                 seen_targets.add(resolved)
                 dep_graph[node.path].append(resolved)
@@ -675,6 +706,168 @@ class DTSExplorerApp:
         self.tree.focus(target_item)
         self.tree.see(target_item)
         return True
+
+    def _status_is_okay(self, node: DTSNode | None) -> bool:
+        if node is None:
+            return False
+        status = node.properties.get("status", "okay")
+        if isinstance(status, bool):
+            return bool(status)
+        return str(status).strip().lower() == "okay"
+
+    def _is_deferred_init(self, node: DTSNode | None) -> bool:
+        if node is None:
+            return False
+        val = node.properties.get("zephyr,deferred-init")
+        if isinstance(val, bool):
+            return val
+        if val is None:
+            return False
+        return str(val).strip().lower() in {"1", "true", "yes", "y"}
+
+    def _get_selected_node(self) -> DTSNode | None:
+        selected = self.tree.selection()
+        if not selected:
+            return None
+        return self.node_by_tree_id.get(selected[0])
+
+    def _collect_subgraph(self, root_path: str, depth: int) -> dict[str, list[str]]:
+        if depth < 1:
+            depth = 1
+
+        out: dict[str, list[str]] = {}
+        frontier: list[tuple[str, int]] = [(root_path, 0)]
+        seen = {(root_path, 0)}
+
+        while frontier:
+            current, dist = frontier.pop(0)
+            deps = self.dependency_graph.get(current, [])
+            out[current] = list(deps)
+            if dist >= depth:
+                continue
+            for dep in deps:
+                state = (dep, dist + 1)
+                if state in seen:
+                    continue
+                seen.add(state)
+                frontier.append(state)
+
+        return out
+
+    def _export_selected_json(self) -> None:
+        node = self._get_selected_node()
+        if node is None:
+            messagebox.showwarning("Export", "Select a node first")
+            return
+
+        depth = max(1, int(self.graph_depth_var.get()))
+        deps_payload = []
+        for dep in node.dependencies:
+            resolved = self._resolve_dependency_target(dep)
+            deps_payload.append(
+                {
+                    "property": dep.property,
+                    "type": dep.dep_type,
+                    "target": resolved or dep.target,
+                    "resolved": resolved is not None,
+                }
+            )
+
+        payload = {
+            "node": node.path,
+            "name": node.name,
+            "label": node.label,
+            "compatible": list(node.compat),
+            "status": node.properties.get("status", "okay"),
+            "deferred_init": self._is_deferred_init(node),
+            "dependencies": deps_payload,
+            "used_by": list(self.reverse_graph.get(node.path, [])),
+            "subgraph_depth": depth,
+            "subgraph": self._collect_subgraph(node.path, depth),
+        }
+
+        suggested = node.name.replace("/", "_").replace("@", "_") or "node"
+        out_path = filedialog.asksaveasfilename(
+            title="Export dependency JSON",
+            defaultextension=".json",
+            initialfile=f"{suggested}_deps.json",
+            filetypes=[("JSON", "*.json"), ("All files", "*")],
+        )
+        if not out_path:
+            return
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+        except Exception as exc:
+            messagebox.showerror("Export", f"Failed to export JSON:\n{exc}")
+            return
+
+        self.status_var.set(f"Exported JSON: {out_path}")
+
+    def _show_dependency_graph(self) -> None:
+        node = self._get_selected_node()
+        if node is None:
+            messagebox.showwarning("Graph", "Select a node first")
+            return
+
+        depth = max(1, int(self.graph_depth_var.get()))
+        subgraph = self._collect_subgraph(node.path, depth)
+
+        edges = []
+        nodes = set()
+        for src, targets in subgraph.items():
+            nodes.add(src)
+            for dst in targets:
+                if src == dst:
+                    continue
+                nodes.add(dst)
+                edges.append((src, dst))
+
+        if len(nodes) <= 1:
+            messagebox.showinfo("Graph", "No resolved dependencies to draw for selected depth")
+            return
+
+        try:
+            nx = importlib.import_module("networkx")
+            plt = importlib.import_module("matplotlib.pyplot")
+        except Exception:
+            messagebox.showinfo(
+                "Graph",
+                "Graph view requires optional packages:\n  pip install networkx matplotlib",
+            )
+            return
+
+        g = nx.DiGraph()
+        g.add_nodes_from(sorted(nodes))
+        g.add_edges_from(edges)
+
+        fig = plt.figure(figsize=(10, 7))
+        ax = fig.add_subplot(111)
+        pos = nx.spring_layout(g, seed=7)
+
+        root_nodes = [n for n in g.nodes if n == node.path]
+        other_nodes = [n for n in g.nodes if n != node.path]
+
+        nx.draw_networkx_nodes(g, pos, nodelist=other_nodes, node_size=900, node_color="#8dc6ff", ax=ax)
+        nx.draw_networkx_nodes(g, pos, nodelist=root_nodes, node_size=1200, node_color="#ffb26b", ax=ax)
+        nx.draw_networkx_edges(g, pos, arrows=True, arrowstyle="-|>", arrowsize=14, width=1.6, ax=ax)
+
+        labels = {}
+        for p in g.nodes:
+            n = self.node_by_path.get(p)
+            if n is None:
+                labels[p] = p
+            elif n.label:
+                labels[p] = f"{n.name}\n({n.label})"
+            else:
+                labels[p] = n.name
+
+        nx.draw_networkx_labels(g, pos, labels=labels, font_size=8, ax=ax)
+        ax.set_title(f"Dependency graph from {node.path} (depth={depth})")
+        ax.axis("off")
+        fig.tight_layout()
+        plt.show()
 
     def _find_compatible(self) -> None:
         if self.dts_root is None:
@@ -857,6 +1050,35 @@ class DTSExplorerApp:
             self.consumers_list.insert(tk.END, display)
             self.consumer_jump_targets.append(consumer_path)
 
+        self.init_list.delete(0, tk.END)
+        self.init_jump_targets = []
+
+        if self._is_deferred_init(node):
+            self.init_list.insert(tk.END, "[NODE] deferred-init enabled")
+        else:
+            self.init_list.insert(tk.END, "[NODE] deferred-init disabled")
+        self.init_jump_targets.append(node.path)
+
+        for dep in node.dependencies:
+            resolved = self._resolve_dependency_target(dep)
+            if resolved is None:
+                row = f"[MISSING ] {dep.dep_type:10s} {dep.property:20s} -> {dep.target}"
+                self.init_list.insert(tk.END, row)
+                self.init_jump_targets.append("")
+                continue
+
+            target_node = self.node_by_path.get(resolved)
+            if self._is_deferred_init(target_node):
+                state = "DEFERRED"
+            elif self._status_is_okay(target_node):
+                state = "OK"
+            else:
+                state = "DISABLED"
+
+            row = f"[{state:8s}] {dep.dep_type:10s} {dep.property:20s} -> {resolved}"
+            self.init_list.insert(tk.END, row)
+            self.init_jump_targets.append(resolved)
+
     def _jump_to_dependency(self, _event) -> None:
         selected = self.deps_list.curselection()
         if not selected:
@@ -888,6 +1110,24 @@ class DTSExplorerApp:
             return
 
         messagebox.showinfo("Consumers", f"No visible node found for path '{target}'")
+
+    def _jump_to_initialization_target(self, _event) -> None:
+        selected = self.init_list.curselection()
+        if not selected:
+            return
+        idx = selected[0]
+        if idx >= len(self.init_jump_targets):
+            return
+
+        target = self.init_jump_targets[idx]
+        if not target:
+            messagebox.showinfo("Initialization", "Cannot jump to unresolved dependency")
+            return
+
+        if self._select_node_by_path(target):
+            return
+
+        messagebox.showinfo("Initialization", f"No visible node found for path '{target}'")
 
     def _on_browse_clicked(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -935,8 +1175,10 @@ class DTSExplorerApp:
         self.prop_tree.delete(*self.prop_tree.get_children(""))
         self.deps_list.delete(0, tk.END)
         self.consumers_list.delete(0, tk.END)
+        self.init_list.delete(0, tk.END)
         self.dep_jump_targets = []
         self.consumer_jump_targets = []
+        self.init_jump_targets = []
 
         self.tk.title(f"Zephyr DTS Explorer - {input_path.name}")
         self.status_var.set(
