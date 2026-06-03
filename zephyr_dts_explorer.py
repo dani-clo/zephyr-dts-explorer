@@ -8,479 +8,34 @@ plain-DTS fallback.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 import importlib
 import json
-import os
-import pickle
 import re
-import sys
 import tkinter as tk
-from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-
-def _ui_state_path() -> Path:
-    return Path.home() / ".zephyr_dts_explorer_state.json"
-
-
-def _load_ui_state(path: Path) -> dict[str, object]:
-    if not path.exists():
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if isinstance(raw, dict):
-            return raw
-    except Exception:
-        pass
-    return {}
-
-
-def _save_ui_state(path: Path, state: dict[str, object]) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, sort_keys=True)
-    except Exception:
-        # State persistence is best-effort and must not block the GUI.
-        pass
-
-
-@dataclass
-class DTSNode:
-    name: str
-    path: str
-    label: str | None = None
-    unit_addr: str | None = None
-    properties: dict[str, str | bool] = field(default_factory=dict)
-    children: list["DTSNode"] = field(default_factory=list)
-    parent: "DTSNode | None" = None
-    line_start: int = 0
-    compat: list[str] = field(default_factory=list)
-    dependencies: list["Dependency"] = field(default_factory=list)
-    phandle_refs: list[str] = field(default_factory=list)
-
-
-@dataclass
-class Dependency:
-    property: str
-    target: str
-    dep_type: str = "other"
-
-
-def _infer_dependency_type(prop_name: str) -> str:
-    key = prop_name.lower().strip()
-
-    if key.startswith("pinctrl"):
-        return "pinctrl"
-    if key.startswith("interrupt"):
-        return "interrupt"
-    if key in {"clocks", "clock", "assigned-clocks", "assigned-clock-parents"}:
-        return "clock"
-    if key in {"resets", "reset-gpios", "reset"}:
-        return "reset"
-    if key in {"dmas", "dma"}:
-        return "dma"
-    if key in {"gpios", "gpio", "cs-gpios", "irq-gpios", "reset-gpios", "enable-gpios"}:
-        return "gpio"
-    if key in {"pwms", "pwm"}:
-        return "pwm"
-    if key in {"iommus", "mboxes", "io-channels", "phys", "power-domains", "vin-supply", "vdd-supply"}:
-        return "provider"
-    if key in {"bus", "parent-bus", "on-bus"}:
-        return "bus"
-    return "other"
-
-
-class DTSParser:
-    def __init__(self, text: str):
-        self.text = text
-
-    @staticmethod
-    def _strip_comments(lines: list[str]) -> list[str]:
-        cleaned: list[str] = []
-        in_block = False
-
-        for line in lines:
-            i = 0
-            out = []
-            while i < len(line):
-                if in_block:
-                    end = line.find("*/", i)
-                    if end == -1:
-                        i = len(line)
-                    else:
-                        in_block = False
-                        i = end + 2
-                else:
-                    start_block = line.find("/*", i)
-                    if start_block == -1:
-                        out.append(line[i:])
-                        break
-                    out.append(line[i:start_block])
-                    i = start_block + 2
-                    in_block = True
-            cleaned.append("".join(out))
-        return cleaned
-
-    @staticmethod
-    def _parse_node_header(header: str) -> tuple[str | None, str]:
-        s = header.strip()
-        label = None
-
-        if s.startswith("/") and s != "/":
-            return None, s
-
-        if ":" in s:
-            left, right = s.split(":", 1)
-            maybe_label = left.strip()
-            maybe_name = right.strip()
-            if maybe_label and maybe_name:
-                label = maybe_label
-                s = maybe_name
-
-        return label, s
-
-    @staticmethod
-    def _parse_property(stmt: str) -> tuple[str | None, str | bool | None]:
-        raw = stmt.strip().rstrip(";").strip()
-        if not raw:
-            return None, None
-
-        if raw.startswith("/delete-") or raw.startswith("/omit-if-no-ref/"):
-            return None, None
-
-        if "=" in raw:
-            key, value = raw.split("=", 1)
-            return key.strip(), value.strip()
-
-        return raw, True
-
-    @staticmethod
-    def _extract_compat(value: str) -> list[str]:
-        return re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', value)
-
-    @staticmethod
-    def _extract_phandles(value: str) -> list[str]:
-        return re.findall(r"&([A-Za-z_][A-Za-z0-9_]*)", value)
-
-    @staticmethod
-    def _extract_phandle_paths(value: str) -> list[str]:
-        return re.findall(r"&\{([^}]+)\}", value)
-
-    def parse(self) -> DTSNode:
-        lines = self.text.splitlines()
-        lines = self._strip_comments(lines)
-
-        root: DTSNode | None = None
-        stack: list[DTSNode] = []
-        pending_prop: list[str] = []
-
-        for idx, line in enumerate(lines, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            if stripped.startswith("/") and stripped.endswith(";") and "{" not in stripped:
-                continue
-
-            if stripped.startswith("};") or stripped == "}":
-                if pending_prop:
-                    pending_prop = []
-                if stack:
-                    stack.pop()
-                continue
-
-            if stripped.endswith("{"):
-                header = stripped[:-1].strip()
-                label, node_name = self._parse_node_header(header)
-
-                if node_name == "/":
-                    path = "/"
-                elif stack and stack[-1].path == "/":
-                    path = f"/{node_name}"
-                elif stack:
-                    path = f"{stack[-1].path}/{node_name}"
-                else:
-                    path = f"/{node_name}"
-
-                unit_addr = None
-                if "@" in node_name:
-                    unit_addr = node_name.split("@", 1)[1]
-
-                node = DTSNode(
-                    name=node_name,
-                    path=path,
-                    label=label,
-                    unit_addr=unit_addr,
-                    line_start=idx,
-                )
-
-                if stack:
-                    node.parent = stack[-1]
-                    stack[-1].children.append(node)
-                else:
-                    root = node
-
-                stack.append(node)
-                continue
-
-            if stack:
-                pending_prop.append(stripped)
-                if stripped.endswith(";"):
-                    full_stmt = " ".join(pending_prop)
-                    pending_prop = []
-
-                    key, value = self._parse_property(full_stmt)
-                    if key is None:
-                        continue
-
-                    stack[-1].properties[key] = value
-                    if key == "compatible" and isinstance(value, str):
-                        stack[-1].compat = self._extract_compat(value)
-                    if isinstance(value, str):
-                        labels = self._extract_phandles(value)
-                        paths = self._extract_phandle_paths(value)
-                        for label in labels:
-                            stack[-1].dependencies.append(
-                                Dependency(
-                                    property=key,
-                                    target=f"&{label}",
-                                    dep_type=_infer_dependency_type(key),
-                                )
-                            )
-                        for path_ref in paths:
-                            normalized = path_ref if path_ref.startswith("/") else f"/{path_ref}"
-                            stack[-1].dependencies.append(
-                                Dependency(
-                                    property=key,
-                                    target=normalized,
-                                    dep_type=_infer_dependency_type(key),
-                                )
-                            )
-
-        def _collect_phandle_refs(node: DTSNode) -> None:
-            node.phandle_refs = [dep.target for dep in node.dependencies]
-            for child in node.children:
-                _collect_phandle_refs(child)
-
-        if root is None:
-            raise ValueError("Unable to parse DTS root node")
-
-        _collect_phandle_refs(root)
-
-        return root
-
-
-def _iter_nested_values(value):
-    if value is None:
-        return
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            yield from _iter_nested_values(item)
-        return
-    if isinstance(value, dict):
-        for item in value.values():
-            yield from _iter_nested_values(item)
-        return
-    yield value
-
-
-def _format_edt_prop_value(value) -> str | bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float, str)):
-        return str(value)
-    if isinstance(value, bytes):
-        return value.hex()
-    if isinstance(value, list):
-        return "[" + ", ".join(str(_format_edt_prop_value(v)) for v in value) + "]"
-    return str(value)
-
-
-def _resolve_edtlib_for_source(source_path: Path):
-    try:
-        return importlib.import_module("devicetree.edtlib")
-    except Exception:
-        pass
-
-    candidates: list[Path] = []
-
-    zbase = os.environ.get("ZEPHYR_BASE")
-    if zbase:
-        candidates.append(Path(zbase) / "scripts" / "dts" / "python-devicetree" / "src")
-
-    cwd = Path.cwd()
-    candidates.append(cwd / "zephyr" / "scripts" / "dts" / "python-devicetree" / "src")
-    candidates.append(cwd.parent / "zephyr" / "scripts" / "dts" / "python-devicetree" / "src")
-
-    for parent in source_path.resolve().parents:
-        candidates.append(parent / "scripts" / "dts" / "python-devicetree" / "src")
-        candidates.append(parent / "zephyr" / "scripts" / "dts" / "python-devicetree" / "src")
-
-    seen = set()
-    for candidate in candidates:
-        c = candidate.resolve()
-        if c in seen:
-            continue
-        seen.add(c)
-        if c.exists():
-            sys.path.insert(0, str(c))
-            try:
-                return importlib.import_module("devicetree.edtlib")
-            except Exception:
-                continue
-
-    return None
-
-
-def _build_tree_from_edt(edt) -> DTSNode:
-    node_map: dict[object, DTSNode] = {}
-
-    def _extract_path_ref(obj) -> str | None:
-        if obj is None:
-            return None
-        if hasattr(obj, "path"):
-            return str(obj.path)
-        node = getattr(obj, "node", None)
-        if node is not None and hasattr(node, "path"):
-            return str(node.path)
-        controller = getattr(obj, "controller", None)
-        if controller is not None and hasattr(controller, "path"):
-            return str(controller.path)
-        return None
-
-    for enode in edt.nodes:
-        label = enode.labels[0] if getattr(enode, "labels", None) else None
-        unit_addr = None
-        if getattr(enode, "unit_addr", None) is not None:
-            unit_addr = str(enode.unit_addr)
-
-        dnode = DTSNode(
-            name=enode.name,
-            path=enode.path,
-            label=label,
-            unit_addr=unit_addr,
-            line_start=getattr(enode, "dep_ordinal", 0),
-            compat=list(getattr(enode, "compats", []) or []),
-        )
-
-        dnode.properties["status"] = str(getattr(enode, "status", "okay"))
-        if dnode.compat:
-            dnode.properties["compatible"] = ", ".join(dnode.compat)
-
-        deps: list[Dependency] = []
-        for prop_name, prop in getattr(enode, "props", {}).items():
-            pval = getattr(prop, "val", None)
-            dnode.properties[prop_name] = _format_edt_prop_value(pval)
-
-            for item in _iter_nested_values(pval):
-                ref_path = _extract_path_ref(item)
-                if ref_path is not None:
-                    deps.append(
-                        Dependency(
-                            property=prop_name,
-                            target=ref_path,
-                            dep_type=_infer_dependency_type(prop_name),
-                        )
-                    )
-
-        for intr in getattr(enode, "interrupts", []) or []:
-            controller = getattr(intr, "controller", None)
-            if controller is not None and hasattr(controller, "path"):
-                deps.append(
-                    Dependency(
-                        property="interrupts",
-                        target=str(controller.path),
-                        dep_type="interrupt",
-                    )
-                )
-        for pc in getattr(enode, "pinctrls", []) or []:
-            for conf_node in getattr(pc, "conf_nodes", []) or []:
-                if hasattr(conf_node, "path"):
-                    deps.append(
-                        Dependency(
-                            property="pinctrl",
-                            target=str(conf_node.path),
-                            dep_type="pinctrl",
-                        )
-                    )
-
-        bus = getattr(enode, "bus", None)
-        if bus is not None and hasattr(bus, "path"):
-            deps.append(Dependency(property="bus", target=str(bus.path), dep_type="bus"))
-
-        on_buses = list(getattr(enode, "on_buses", []) or [])
-        if on_buses:
-            dnode.properties["on-buses"] = ", ".join(str(x) for x in on_buses)
-            for on_bus in on_buses:
-                ref = _extract_path_ref(on_bus)
-                if ref is not None:
-                    deps.append(Dependency(property="on_buses", target=ref, dep_type="bus"))
-
-        depends_on = getattr(enode, "depends_on", None)
-        for dep_node in depends_on or []:
-            ref = _extract_path_ref(dep_node)
-            if ref is not None:
-                deps.append(
-                    Dependency(
-                        property="depends_on",
-                        target=ref,
-                        dep_type="other",
-                    )
-                )
-
-        dedup: list[Dependency] = []
-        seen_ref: set[tuple[str, str, str]] = set()
-        for dep in deps:
-            key = (dep.property, dep.target, dep.dep_type)
-            if key in seen_ref:
-                continue
-            seen_ref.add(key)
-            dedup.append(dep)
-
-        dnode.dependencies = dedup
-        dnode.phandle_refs = [dep.target for dep in dedup]
-
-        node_map[enode] = dnode
-
-    root = None
-    for enode, dnode in node_map.items():
-        parent = getattr(enode, "parent", None)
-        if parent is None:
-            root = dnode
-            continue
-        pnode = node_map.get(parent)
-        if pnode is not None:
-            dnode.parent = pnode
-            pnode.children.append(dnode)
-
-    if root is None:
-        raise ValueError("EDT did not provide a root node")
-    return root
-
-
-def load_tree(source_path: Path) -> tuple[DTSNode, str]:
-    edt_pickle = source_path if source_path.suffix == ".pickle" else source_path.with_name("edt.pickle")
-
-    if edt_pickle.exists():
-        edtlib = _resolve_edtlib_for_source(source_path)
-        if edtlib is not None:
-            try:
-                with open(edt_pickle, "rb") as f:
-                    edt = pickle.load(f)
-                return _build_tree_from_edt(edt), f"EDT ({edt_pickle})"
-            except Exception:
-                pass
-
-    if source_path.suffix == ".pickle":
-        raise ValueError("Unable to load edt.pickle (missing/incompatible edtlib)")
-
-    text = source_path.read_text(encoding="utf-8", errors="replace")
-    parser = DTSParser(text)
-    return parser.parse(), f"DTS ({source_path})"
+from dts_graph import (
+    collect_subgraph,
+    is_deferred_init,
+    iter_nodes,
+    rebuild_indexes,
+    resolve_dependency_target,
+    status_is_okay,
+)
+from dts_models import DTSNode, Dependency
+from dts_parsers import load_tree
+from dts_persistence import build_recent_labels, load_ui_state, save_ui_state, ui_state_path
+from dts_ui_support import (
+    build_consumer_items,
+    build_dependency_items,
+    build_graph_labels,
+    build_initialization_items,
+    collect_matching_paths,
+    node_display_name,
+    node_matches,
+    node_summary_text,
+)
 
 
 class DTSExplorerApp:
@@ -506,15 +61,15 @@ class DTSExplorerApp:
         self.consumer_jump_targets: list[str] = []
         self.init_jump_targets: list[str] = []
 
-        self._state_path = _ui_state_path()
-        state = _load_ui_state(self._state_path)
+        self._state_path = ui_state_path()
+        state = load_ui_state(self._state_path)
         self.last_dir = str(state.get("last_dir", ""))
         raw_recent = state.get("recent_files", [])
         self.recent_files = [str(x) for x in raw_recent if isinstance(x, str)]
         self.recent_files = [x for x in self.recent_files if Path(x).exists()]
         if len(self.recent_files) > 12:
             self.recent_files = self.recent_files[:12]
-        self.recent_display_files = self._build_recent_labels(self.recent_files)
+        self.recent_display_files = build_recent_labels(self.recent_files)
 
         self.search_var = tk.StringVar()
         self.filter_okay_var = tk.BooleanVar(value=False)
@@ -533,58 +88,6 @@ class DTSExplorerApp:
             self.node_by_label[node.label] = node
         for child in node.children:
             self._index_nodes(child)
-
-    @staticmethod
-    def _tail_path(path: Path, parts: int) -> str:
-        chunks = path.parts
-        if len(chunks) <= parts:
-            return "/".join(chunks)
-        return ".../" + "/".join(chunks[-parts:])
-
-    def _build_recent_labels(self, paths: list[str]) -> list[str]:
-        labels: list[str] = []
-        for raw in paths:
-            p = Path(raw)
-            board = ""
-            if "build" in p.parts:
-                i = p.parts.index("build")
-                if i + 1 < len(p.parts):
-                    board = p.parts[i + 1]
-
-            short_tail = self._tail_path(p, 3)
-            if board:
-                labels.append(f"{board} | {short_tail}")
-            else:
-                labels.append(short_tail)
-
-        # If some labels are still identical, extend tail for the conflicting ones.
-        counts: dict[str, int] = defaultdict(int)
-        for label in labels:
-            counts[label] += 1
-
-        for idx, label in enumerate(labels):
-            if counts[label] <= 1:
-                continue
-            p = Path(paths[idx])
-            board = ""
-            if "build" in p.parts:
-                i = p.parts.index("build")
-                if i + 1 < len(p.parts):
-                    board = p.parts[i + 1]
-            long_tail = self._tail_path(p, 5)
-            labels[idx] = f"{board} | {long_tail}" if board else long_tail
-
-        # Final uniqueness guard.
-        seen: dict[str, int] = defaultdict(int)
-        unique_labels: list[str] = []
-        for label in labels:
-            seen[label] += 1
-            if seen[label] == 1:
-                unique_labels.append(label)
-            else:
-                unique_labels.append(f"{label} ({seen[label]})")
-
-        return unique_labels
 
     def _build_ui(self) -> None:
         self.tk.title("Zephyr DTS Explorer")
@@ -711,11 +214,7 @@ class DTSExplorerApp:
         ttk.Label(status, textvariable=self.status_var).pack(anchor=tk.W)
 
     def _node_display_name(self, node: DTSNode) -> str:
-        if node.name == "/":
-            return "/"
-        if node.label:
-            return f"{node.name} ({node.label})"
-        return node.name
+        return node_display_name(node)
 
     def _insert_tree_node(self, parent_id: str, node: DTSNode) -> None:
         item_id = self.tree.insert(
@@ -742,62 +241,18 @@ class DTSExplorerApp:
             self.tree.item(top[0], open=True)
 
     def _iter_nodes(self, node: DTSNode):
-        yield node
-        for child in node.children:
-            yield from self._iter_nodes(child)
+        yield from iter_nodes(node)
 
     def _resolve_dependency_target(self, dep: Dependency) -> str | None:
-        target = dep.target.strip()
-        if not target:
-            return None
-        if target.startswith("/"):
-            return target if target in self.node_by_path else None
-        if target.startswith("&"):
-            label = target[1:]
-            node = self.node_by_label.get(label)
-            return node.path if node else None
-        node = self.node_by_label.get(target)
-        if node:
-            return node.path
-        if target in self.node_by_path:
-            return target
-        return None
+        return resolve_dependency_target(dep, self.node_by_path, self.node_by_label)
 
     def _rebuild_indexes(self) -> None:
-        if self.dts_root is None:
-            self.dependency_graph = {}
-            self.reverse_graph = {}
-            self.compat_index = {}
-            return
-
-        allow_self_loops = self.show_self_loops_var.get()
-
-        dep_graph: dict[str, list[str]] = defaultdict(list)
-        rev_graph: dict[str, list[str]] = defaultdict(list)
-        comp_index: dict[str, list[str]] = defaultdict(list)
-
-        for node in self._iter_nodes(self.dts_root):
-            seen_targets: set[str] = set()
-            for dep in node.dependencies:
-                resolved = self._resolve_dependency_target(dep)
-                if resolved is None:
-                    continue
-                if not allow_self_loops and resolved == node.path:
-                    continue
-                if resolved in seen_targets:
-                    continue
-                seen_targets.add(resolved)
-                dep_graph[node.path].append(resolved)
-                rev_graph[resolved].append(node.path)
-
-            for comp in node.compat:
-                c = comp.strip().lower()
-                if c:
-                    comp_index[c].append(node.path)
-
-        self.dependency_graph = {k: sorted(v) for k, v in dep_graph.items()}
-        self.reverse_graph = {k: sorted(v) for k, v in rev_graph.items()}
-        self.compat_index = {k: sorted(v) for k, v in comp_index.items()}
+        self.dependency_graph, self.reverse_graph, self.compat_index = rebuild_indexes(
+            self.dts_root,
+            self.node_by_path,
+            self.node_by_label,
+            self.show_self_loops_var.get(),
+        )
 
     def _select_node_by_path(self, path: str) -> bool:
         target_item = None
@@ -821,24 +276,6 @@ class DTSExplorerApp:
         self.tree.see(target_item)
         return True
 
-    def _status_is_okay(self, node: DTSNode | None) -> bool:
-        if node is None:
-            return False
-        status = node.properties.get("status", "okay")
-        if isinstance(status, bool):
-            return bool(status)
-        return str(status).strip().lower() == "okay"
-
-    def _is_deferred_init(self, node: DTSNode | None) -> bool:
-        if node is None:
-            return False
-        val = node.properties.get("zephyr,deferred-init")
-        if isinstance(val, bool):
-            return val
-        if val is None:
-            return False
-        return str(val).strip().lower() in {"1", "true", "yes", "y"}
-
     def _get_selected_node(self) -> DTSNode | None:
         selected = self.tree.selection()
         if not selected:
@@ -846,27 +283,7 @@ class DTSExplorerApp:
         return self.node_by_tree_id.get(selected[0])
 
     def _collect_subgraph(self, root_path: str, depth: int) -> dict[str, list[str]]:
-        if depth < 1:
-            depth = 1
-
-        out: dict[str, list[str]] = {}
-        frontier: list[tuple[str, int]] = [(root_path, 0)]
-        seen = {(root_path, 0)}
-
-        while frontier:
-            current, dist = frontier.pop(0)
-            deps = self.dependency_graph.get(current, [])
-            out[current] = list(deps)
-            if dist >= depth:
-                continue
-            for dep in deps:
-                state = (dep, dist + 1)
-                if state in seen:
-                    continue
-                seen.add(state)
-                frontier.append(state)
-
-        return out
+        return collect_subgraph(self.dependency_graph, root_path, depth)
 
     def _on_graph_options_changed(self) -> None:
         if self.dts_root is None:
@@ -902,7 +319,7 @@ class DTSExplorerApp:
             "label": node.label,
             "compatible": list(node.compat),
             "status": node.properties.get("status", "okay"),
-            "deferred_init": self._is_deferred_init(node),
+            "deferred_init": is_deferred_init(node),
             "dependencies": deps_payload,
             "used_by": list(self.reverse_graph.get(node.path, [])),
             "subgraph_depth": depth,
@@ -978,14 +395,7 @@ class DTSExplorerApp:
         nx.draw_networkx_edges(g, pos, arrows=True, arrowstyle="-|>", arrowsize=14, width=1.6, ax=ax)
 
         labels = {}
-        for p in g.nodes:
-            n = self.node_by_path.get(p)
-            if n is None:
-                labels[p] = p
-            elif n.label:
-                labels[p] = f"{n.name}\n({n.label})"
-            else:
-                labels[p] = n.name
+        labels = build_graph_labels(list(g.nodes), self.node_by_path)
 
         nx.draw_networkx_labels(g, pos, labels=labels, font_size=8, ax=ax)
         ax.set_title(f"Dependency graph from {node.path} (depth={depth})")
@@ -1026,45 +436,6 @@ class DTSExplorerApp:
         self._select_node_by_path(dedup_partial[0])
         self.status_var.set(f"Compatible '{query}' partial_matches={len(dedup_partial)}")
 
-    def _node_matches(self, node: DTSNode, query: str, only_okay: bool) -> bool:
-        if only_okay:
-            status = node.properties.get("status")
-            if isinstance(status, str) and "okay" not in status:
-                return False
-
-        if not query:
-            return True
-
-        q = query.lower()
-        haystacks = [
-            node.name.lower(),
-            node.path.lower(),
-            (node.label or "").lower(),
-            " ".join(node.compat).lower(),
-            " ".join(node.properties.keys()).lower(),
-        ]
-
-        prop_vals = []
-        for key, value in node.properties.items():
-            prop_vals.append(f"{key}={value}")
-        haystacks.append(" ".join(prop_vals).lower())
-
-        return any(q in h for h in haystacks)
-
-    def _collect_matching_paths(self, query: str, only_okay: bool) -> set[str]:
-        if self.dts_root is None:
-            return set()
-
-        matched = set()
-        for node in self._iter_nodes(self.dts_root):
-            if self._node_matches(node, query, only_okay):
-                matched.add(node.path)
-                p = node.parent
-                while p is not None:
-                    matched.add(p.path)
-                    p = p.parent
-        return matched
-
     def _filter_tree_recursive(self, item_id: str, allowed_paths: set[str]) -> bool:
         node = self.node_by_tree_id[item_id]
         keep_self = node.path in allowed_paths
@@ -1092,13 +463,13 @@ class DTSExplorerApp:
         only_okay = self.filter_okay_var.get()
         self._populate_tree()
 
-        allowed = self._collect_matching_paths(query, only_okay)
+        allowed = collect_matching_paths(self.dts_root, query, only_okay)
         roots = self.tree.get_children("")
         for root_id in roots:
             self._filter_tree_recursive(root_id, allowed)
 
         total_matches = sum(
-            1 for n in self._iter_nodes(self.dts_root) if self._node_matches(n, query, only_okay)
+            1 for n in self._iter_nodes(self.dts_root) if node_matches(n, query, only_okay)
         )
         self.status_var.set(
             f"Query='{query or '*'}'  matches={total_matches}  filter_okay={only_okay}"
@@ -1117,22 +488,7 @@ class DTSExplorerApp:
             return
 
         node = self.node_by_tree_id[selected[0]]
-        parent_path = node.parent.path if node.parent else "<none>"
-        compat = ", ".join(node.compat) if node.compat else "<none>"
-
-        self.summary_var.set(
-            "\n".join(
-                [
-                    f"Name: {node.name}",
-                    f"Path: {node.path}",
-                    f"Label: {node.label or '<none>'}",
-                    f"Parent: {parent_path}",
-                    f"Children: {len(node.children)}",
-                    f"Compatible: {compat}",
-                    f"Line/Ordinal: {node.line_start}",
-                ]
-            )
-        )
+        self.summary_var.set(node_summary_text(node))
 
         self.prop_tree.delete(*self.prop_tree.get_children(""))
         for key in sorted(node.properties.keys()):
@@ -1140,68 +496,25 @@ class DTSExplorerApp:
             self.prop_tree.insert("", tk.END, text=key, values=(str(val),))
 
         self.deps_list.delete(0, tk.END)
+        dep_items = build_dependency_items(node, self._resolve_dependency_target)
         self.dep_jump_targets = []
-
-        seen_deps: set[tuple[str, str, str]] = set()
-        for dep in node.dependencies:
-            dep_key = (dep.property, dep.dep_type, dep.target)
-            if dep_key in seen_deps:
-                continue
-            seen_deps.add(dep_key)
-
-            resolved = self._resolve_dependency_target(dep)
-            if resolved is None:
-                label = f"{dep.dep_type:10s} {dep.property:20s} -> {dep.target} (unresolved)"
-                jump_target = ""
-            else:
-                label = f"{dep.dep_type:10s} {dep.property:20s} -> {resolved}"
-                jump_target = resolved
-
+        for label, jump_target in dep_items:
             self.deps_list.insert(tk.END, label)
             self.dep_jump_targets.append(jump_target)
 
         self.consumers_list.delete(0, tk.END)
+        consumer_items = build_consumer_items(node.path, self.reverse_graph, self.node_by_path)
         self.consumer_jump_targets = []
-        for consumer_path in self.reverse_graph.get(node.path, []):
-            consumer = self.node_by_path.get(consumer_path)
-            if consumer is None:
-                display = consumer_path
-            elif consumer.label:
-                display = f"{consumer.name} ({consumer.label})  [{consumer.path}]"
-            else:
-                display = f"{consumer.name}  [{consumer.path}]"
-
+        for display, consumer_path in consumer_items:
             self.consumers_list.insert(tk.END, display)
             self.consumer_jump_targets.append(consumer_path)
 
         self.init_list.delete(0, tk.END)
+        init_items = build_initialization_items(node, self._resolve_dependency_target, self.node_by_path)
         self.init_jump_targets = []
-
-        if self._is_deferred_init(node):
-            self.init_list.insert(tk.END, "[NODE] deferred-init enabled")
-        else:
-            self.init_list.insert(tk.END, "[NODE] deferred-init disabled")
-        self.init_jump_targets.append(node.path)
-
-        for dep in node.dependencies:
-            resolved = self._resolve_dependency_target(dep)
-            if resolved is None:
-                row = f"[MISSING ] {dep.dep_type:10s} {dep.property:20s} -> {dep.target}"
-                self.init_list.insert(tk.END, row)
-                self.init_jump_targets.append("")
-                continue
-
-            target_node = self.node_by_path.get(resolved)
-            if self._is_deferred_init(target_node):
-                state = "DEFERRED"
-            elif self._status_is_okay(target_node):
-                state = "OK"
-            else:
-                state = "DISABLED"
-
-            row = f"[{state:8s}] {dep.dep_type:10s} {dep.property:20s} -> {resolved}"
+        for row, jump_target in init_items:
             self.init_list.insert(tk.END, row)
-            self.init_jump_targets.append(resolved)
+            self.init_jump_targets.append(jump_target)
 
     def _jump_to_dependency(self, _event) -> None:
         selected = self.deps_list.curselection()
@@ -1294,7 +607,7 @@ class DTSExplorerApp:
             if p != loaded and Path(p).exists():
                 ordered.append(p)
         self.recent_files = ordered[:12]
-        self.recent_display_files = self._build_recent_labels(self.recent_files)
+        self.recent_display_files = build_recent_labels(self.recent_files)
 
         self.recent_combo["values"] = self.recent_display_files
         if self.recent_display_files:
@@ -1302,7 +615,7 @@ class DTSExplorerApp:
         else:
             self.recent_var.set("")
 
-        _save_ui_state(
+        save_ui_state(
             self._state_path,
             {
                 "last_dir": self.last_dir,
