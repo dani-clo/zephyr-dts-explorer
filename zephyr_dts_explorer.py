@@ -21,6 +21,33 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 
+def _ui_state_path() -> Path:
+    return Path.home() / ".zephyr_dts_explorer_state.json"
+
+
+def _load_ui_state(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return {}
+
+
+def _save_ui_state(path: Path, state: dict[str, object]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+    except Exception:
+        # State persistence is best-effort and must not block the GUI.
+        pass
+
+
 @dataclass
 class DTSNode:
     name: str
@@ -473,9 +500,21 @@ class DTSExplorerApp:
         self.compat_index: dict[str, list[str]] = {}
         self.compat_search_var = tk.StringVar()
         self.graph_depth_var = tk.IntVar(value=1)
+        self.show_self_loops_var = tk.BooleanVar(value=False)
+        self.recent_var = tk.StringVar()
         self.dep_jump_targets: list[str] = []
         self.consumer_jump_targets: list[str] = []
         self.init_jump_targets: list[str] = []
+
+        self._state_path = _ui_state_path()
+        state = _load_ui_state(self._state_path)
+        self.last_dir = str(state.get("last_dir", ""))
+        raw_recent = state.get("recent_files", [])
+        self.recent_files = [str(x) for x in raw_recent if isinstance(x, str)]
+        self.recent_files = [x for x in self.recent_files if Path(x).exists()]
+        if len(self.recent_files) > 12:
+            self.recent_files = self.recent_files[:12]
+        self.recent_display_files = self._build_recent_labels(self.recent_files)
 
         self.search_var = tk.StringVar()
         self.filter_okay_var = tk.BooleanVar(value=False)
@@ -495,6 +534,58 @@ class DTSExplorerApp:
         for child in node.children:
             self._index_nodes(child)
 
+    @staticmethod
+    def _tail_path(path: Path, parts: int) -> str:
+        chunks = path.parts
+        if len(chunks) <= parts:
+            return "/".join(chunks)
+        return ".../" + "/".join(chunks[-parts:])
+
+    def _build_recent_labels(self, paths: list[str]) -> list[str]:
+        labels: list[str] = []
+        for raw in paths:
+            p = Path(raw)
+            board = ""
+            if "build" in p.parts:
+                i = p.parts.index("build")
+                if i + 1 < len(p.parts):
+                    board = p.parts[i + 1]
+
+            short_tail = self._tail_path(p, 3)
+            if board:
+                labels.append(f"{board} | {short_tail}")
+            else:
+                labels.append(short_tail)
+
+        # If some labels are still identical, extend tail for the conflicting ones.
+        counts: dict[str, int] = defaultdict(int)
+        for label in labels:
+            counts[label] += 1
+
+        for idx, label in enumerate(labels):
+            if counts[label] <= 1:
+                continue
+            p = Path(paths[idx])
+            board = ""
+            if "build" in p.parts:
+                i = p.parts.index("build")
+                if i + 1 < len(p.parts):
+                    board = p.parts[i + 1]
+            long_tail = self._tail_path(p, 5)
+            labels[idx] = f"{board} | {long_tail}" if board else long_tail
+
+        # Final uniqueness guard.
+        seen: dict[str, int] = defaultdict(int)
+        unique_labels: list[str] = []
+        for label in labels:
+            seen[label] += 1
+            if seen[label] == 1:
+                unique_labels.append(label)
+            else:
+                unique_labels.append(f"{label} ({seen[label]})")
+
+        return unique_labels
+
     def _build_ui(self) -> None:
         self.tk.title("Zephyr DTS Explorer")
         self.tk.geometry("1280x800")
@@ -509,6 +600,17 @@ class DTSExplorerApp:
 
         ttk.Button(source_bar, text="Browse", command=self._on_browse_clicked).pack(side=tk.LEFT)
         ttk.Button(source_bar, text="Load", command=self._on_load_clicked).pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(source_bar, text="Recent:").pack(side=tk.LEFT, padx=(16, 4))
+        self.recent_combo = ttk.Combobox(
+            source_bar,
+            textvariable=self.recent_var,
+            values=self.recent_display_files,
+            state="readonly",
+            width=44,
+        )
+        self.recent_combo.pack(side=tk.LEFT)
+        self.recent_combo.bind("<<ComboboxSelected>>", self._on_recent_selected)
 
         top = ttk.Frame(self.tk, padding=(8, 0, 8, 8))
         top.pack(fill=tk.X)
@@ -537,6 +639,12 @@ class DTSExplorerApp:
         ttk.Label(top, text="Depth:").pack(side=tk.LEFT, padx=(16, 4))
         depth_spin = ttk.Spinbox(top, from_=1, to=6, textvariable=self.graph_depth_var, width=4)
         depth_spin.pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            top,
+            text="Show self loops",
+            variable=self.show_self_loops_var,
+            command=self._on_graph_options_changed,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(top, text="Show dependency graph", command=self._show_dependency_graph).pack(
             side=tk.LEFT, padx=(8, 0)
         )
@@ -662,6 +770,8 @@ class DTSExplorerApp:
             self.compat_index = {}
             return
 
+        allow_self_loops = self.show_self_loops_var.get()
+
         dep_graph: dict[str, list[str]] = defaultdict(list)
         rev_graph: dict[str, list[str]] = defaultdict(list)
         comp_index: dict[str, list[str]] = defaultdict(list)
@@ -670,7 +780,11 @@ class DTSExplorerApp:
             seen_targets: set[str] = set()
             for dep in node.dependencies:
                 resolved = self._resolve_dependency_target(dep)
-                if resolved is None or resolved == node.path or resolved in seen_targets:
+                if resolved is None:
+                    continue
+                if not allow_self_loops and resolved == node.path:
+                    continue
+                if resolved in seen_targets:
                     continue
                 seen_targets.add(resolved)
                 dep_graph[node.path].append(resolved)
@@ -754,6 +868,15 @@ class DTSExplorerApp:
 
         return out
 
+    def _on_graph_options_changed(self) -> None:
+        if self.dts_root is None:
+            return
+
+        self._rebuild_indexes()
+        selected = self.tree.selection()
+        if selected:
+            self._on_select_node(None)
+
     def _export_selected_json(self) -> None:
         node = self._get_selected_node()
         if node is None:
@@ -816,10 +939,11 @@ class DTSExplorerApp:
 
         edges = []
         nodes = set()
+        allow_self_loops = self.show_self_loops_var.get()
         for src, targets in subgraph.items():
             nodes.add(src)
             for dst in targets:
-                if src == dst:
+                if src == dst and not allow_self_loops:
                     continue
                 nodes.add(dst)
                 edges.append((src, dst))
@@ -1130,8 +1254,10 @@ class DTSExplorerApp:
         messagebox.showinfo("Initialization", f"No visible node found for path '{target}'")
 
     def _on_browse_clicked(self) -> None:
+        initial_dir = self.last_dir if self.last_dir and Path(self.last_dir).exists() else None
         file_path = filedialog.askopenfilename(
             title="Select Zephyr devicetree input",
+            initialdir=initial_dir,
             filetypes=[
                 ("Devicetree files", "*.dts *.pickle"),
                 ("DTS", "*.dts"),
@@ -1141,6 +1267,48 @@ class DTSExplorerApp:
         )
         if file_path:
             self.input_var.set(file_path)
+
+    def _on_recent_selected(self, _event) -> None:
+        idx = self.recent_combo.current()
+        if idx < 0 or idx >= len(self.recent_files):
+            selected = self.recent_var.get().strip()
+            if not selected:
+                return
+            try:
+                idx = self.recent_display_files.index(selected)
+            except ValueError:
+                return
+
+        chosen = self.recent_files[idx]
+        if not chosen:
+            return
+        self.input_var.set(chosen)
+        self._on_load_clicked()
+
+    def _remember_loaded_file(self, input_path: Path) -> None:
+        self.last_dir = str(input_path.parent)
+
+        loaded = str(input_path)
+        ordered = [loaded]
+        for p in self.recent_files:
+            if p != loaded and Path(p).exists():
+                ordered.append(p)
+        self.recent_files = ordered[:12]
+        self.recent_display_files = self._build_recent_labels(self.recent_files)
+
+        self.recent_combo["values"] = self.recent_display_files
+        if self.recent_display_files:
+            self.recent_var.set(self.recent_display_files[0])
+        else:
+            self.recent_var.set("")
+
+        _save_ui_state(
+            self._state_path,
+            {
+                "last_dir": self.last_dir,
+                "recent_files": self.recent_files,
+            },
+        )
 
     def _on_load_clicked(self) -> None:
         raw = self.input_var.get().strip()
@@ -1181,6 +1349,7 @@ class DTSExplorerApp:
         self.init_jump_targets = []
 
         self.tk.title(f"Zephyr DTS Explorer - {input_path.name}")
+        self._remember_loaded_file(input_path)
         self.status_var.set(
             f"Loaded: {input_path}  backend={backend}  nodes={len(self.node_by_path)}  compatibles={len(self.compat_index)}"
         )
@@ -1195,12 +1364,18 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         help="Optional path to .dts or edt.pickle to load at startup",
     )
+    parser.add_argument(
+        "--file",
+        dest="input_file_opt",
+        help="Optional path to .dts or edt.pickle to load at startup",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    initial = Path(args.input_file).expanduser().resolve() if args.input_file else None
+    requested = args.input_file_opt or args.input_file
+    initial = Path(requested).expanduser().resolve() if requested else None
 
     tk_root = tk.Tk()
     app = DTSExplorerApp(tk_root, initial)
